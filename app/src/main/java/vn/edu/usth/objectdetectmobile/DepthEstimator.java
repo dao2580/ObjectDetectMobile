@@ -1,7 +1,6 @@
 package vn.edu.usth.objectdetectmobile;
 
 import android.content.Context;
-
 import androidx.annotation.NonNull;
 import android.util.Log;
 
@@ -48,10 +47,11 @@ public class DepthEstimator implements AutoCloseable {
     private static final float MAX_USER_SCALE = 4f;
     private static volatile float userScale = 1f;
 
-    // Các giá trị raw trung bình bạn đo được (ví dụ giữ vật thể ở 30cm và 200cm, log raw rồi sửa ở đây)
+    // NEW: fraction of bbox used for "danger region" (same idea as Python's frac)
+    private static final float DANGER_REGION_FRAC = 0.3f;
 
-    // private static final float[] CAL_CM  = {20f, 40f, 50f, 75f, 100f, 150f, 200f, 300f, 400f, 500f};
-    // private static final float[] CAL_RAW = {3.22f, 2.32f, 1.95f, 1.72f, 1.59f, 1.49f, 1.232f, 1.0f, 0.7f, 0.3f};
+    // NEW: region mode, mirroring Python's "center" / "bottom"
+    private enum DangerRegionMode { CENTER, BOTTOM }
 
     // Depth Anything v2 metric outputs depth in meters; convert directly to centimeters.
     private static float rawToCentimeters(float raw) {
@@ -75,7 +75,6 @@ public class DepthEstimator implements AutoCloseable {
         if (Float.isNaN(depthCm)) return depthCm;
         return depthCm * userScale;
     }
-
 
     private final OrtEnvironment env;
     private final OrtSession.SessionOptions sessionOptions;
@@ -134,34 +133,143 @@ public class DepthEstimator implements AutoCloseable {
         return new DepthMap(depthFull, srcW, srcH, min, max);
     }
 
-    private static float averageDepth(DepthMap map, ObjectDetector.Detection d) {
-        if (map.width == 0 || map.height == 0) return Float.NaN;
-        int x1 = clamp((int)Math.floor(d.x1), 0, map.width-1);
-        int y1 = clamp((int)Math.floor(d.y1), 0, map.height-1);
-        int x2 = clamp((int)Math.ceil(d.x2), 0, map.width-1);
-        int y2 = clamp((int)Math.ceil(d.y2), 0, map.height-1);
-        int spanX = Math.max(1, x2 - x1);
-        int spanY = Math.max(1, y2 - y1);
-        int stepX = Math.max(1, spanX / 12);
-        int stepY = Math.max(1, spanY / 12);
-        float sum = 0f; int count = 0;
-        for (int y=y1; y<=y2; y+=stepY) {
-            int base = y * map.width;
-            for (int x=x1; x<=x2; x+=stepX) {
-                sum += map.depth[base + x];
-                count++;
-            }
+    // NEW: decide which boxes should use the "bottom" region (tune IDs for your model)
+    private static boolean isBottomRegionClass(int cls) {
+        // Example for COCO-style IDs; change according to your dataset:
+        // 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck, ...
+        switch (cls) {
+            case 1: // bicycle
+            case 2: // car
+            case 3: // motorcycle
+            case 5: // bus
+            case 7: // truck
+                return true;
+            default:
+                return false;
         }
-        if (count == 0) return Float.NaN;
-        float raw = sum / count;
-        if (LOG_RAW_DEPTH) {
-            Log.d(TAG, String.format(Locale.US,
-                    "rawDepth=%.3f (frame min=%.3f max=%.3f, cls=%d)",
-                    raw, map.min, map.max, d.cls));
-        }
-        return rawToCentimeters(raw);
     }
 
+    // NEW: port of Python _compute_box_distance, but returns raw depth (model units).
+    private static float sampleDangerRegionRaw(DepthMap map, ObjectDetector.Detection d, float frac, DangerRegionMode mode) {
+        if (map.width == 0 || map.height == 0) return Float.NaN;
+
+        int W = map.width;
+        int H = map.height;
+
+        // Clamp bbox to image bounds
+        int x1 = clamp((int) Math.floor(d.x1), 0, W - 1);
+        int y1 = clamp((int) Math.floor(d.y1), 0, H - 1);
+        int x2 = clamp((int) Math.ceil(d.x2), 0, W);
+        int y2 = clamp((int) Math.ceil(d.y2), 0, H);
+
+        if (x2 <= x1 || y2 <= y1) return Float.NaN;
+
+        int w = x2 - x1;
+        int h = y2 - y1;
+        if (w <= 0 || h <= 0) return Float.NaN;
+
+        int sx1, sy1, sx2, sy2;
+
+        if (mode == DangerRegionMode.BOTTOM) {
+            // Bottom band: height = frac * h
+            int ch = (int) (h * frac);
+            if (ch <= 0) return Float.NaN;
+
+            // Vertical range: bottom frac of the box
+            int yStart = Math.max(y1, y2 - ch);
+
+            // Central 50% of width
+            int centerBandWidth = (int) (w * 0.5f);
+            if (centerBandWidth <= 0) return Float.NaN;
+
+            int cx = (x1 + x2) / 2;
+            int xStart = Math.max(x1, cx - centerBandWidth / 2);
+            int xEnd = Math.min(x2, xStart + centerBandWidth);
+            if (xEnd <= xStart) return Float.NaN;
+
+            sx1 = xStart;
+            sx2 = xEnd;
+            sy1 = yStart;
+            sy2 = y2;   // bottom of box
+        } else {
+            // CENTER mode: central frac of width and height
+            int cw = (int) (w * frac);
+            int ch = (int) (h * frac);
+            if (cw <= 0 || ch <= 0) return Float.NaN;
+
+            int cx = (x1 + x2) / 2;
+            int cy = (y1 + y2) / 2;
+
+            int cx1 = Math.max(0, cx - cw / 2);
+            int cy1 = Math.max(0, cy - ch / 2);
+            int cx2 = Math.min(W, cx1 + cw);
+            int cy2 = Math.min(H, cy1 + ch);
+            if (cx2 <= cx1 || cy2 <= cy1) return Float.NaN;
+
+            sx1 = cx1;
+            sx2 = cx2;
+            sy1 = cy1;
+            sy2 = cy2;
+        }
+
+        if (sx2 <= sx1 || sy2 <= sy1) return Float.NaN;
+
+        int regionW = sx2 - sx1;
+        int regionH = sy2 - sy1;
+        int capacity = regionW * regionH;
+        if (capacity <= 0) return Float.NaN;
+
+        float[] vals = new float[capacity];
+        int n = 0;
+
+        // Collect all valid (>0) depth values in the region
+        for (int y = sy1; y < sy2; y++) {
+            int base = y * W;
+            for (int x = sx1; x < sx2; x++) {
+                float v = map.depth[base + x];
+                if (v > 0f) {
+                    vals[n++] = v;
+                }
+            }
+        }
+
+        if (n == 0) return Float.NaN;
+
+        // Median of vals[0..n)
+        java.util.Arrays.sort(vals, 0, n);
+        float median;
+        if ((n & 1) == 1) {
+            median = vals[n / 2];
+        } else {
+            int i = n / 2;
+            median = (vals[i - 1] + vals[i]) * 0.5f;
+        }
+
+        return median;
+    }
+
+    // CHANGED: use danger-region + median instead of full-box average
+    private static float averageDepth(DepthMap map, ObjectDetector.Detection d) {
+        if (map == null || map.width == 0 || map.height == 0) return Float.NaN;
+
+        // Decide region mode based on class
+        DangerRegionMode mode = isBottomRegionClass(d.cls)
+                ? DangerRegionMode.BOTTOM
+                : DangerRegionMode.CENTER;
+
+        // Same frac as your Python call (0.3)
+        float raw = sampleDangerRegionRaw(map, d, DANGER_REGION_FRAC, mode);
+
+        if (Float.isNaN(raw)) return Float.NaN;
+
+        if (LOG_RAW_DEPTH) {
+            Log.d(TAG, String.format(Locale.US,
+                    "rawDepthMedian=%.3f (frame min=%.3f max=%.3f, cls=%d, mode=%s)",
+                    raw, map.min, map.max, d.cls, mode.name()));
+        }
+
+        return rawToCentimeters(raw);
+    }
 
     private static float normalize(float v, float min, float max) {
         float range = max - min;
@@ -227,48 +335,48 @@ public class DepthEstimator implements AutoCloseable {
     }
 
     private static int[] resizeNearest(int[] src, int srcW, int srcH, int dstW, int dstH) {
-        int[] dst = new int[dstW*dstH];
-        float sx = dstW / (float)srcW;
-        float sy = dstH / (float)srcH;
-        for (int y=0;y<dstH;y++){
-            int py = Math.min((int)(y / sy), srcH-1);
-            for (int x=0;x<dstW;x++){
-                int px = Math.min((int)(x / sx), srcW-1);
-                dst[y*dstW + x] = src[py*srcW + px];
+        int[] dst = new int[dstW * dstH];
+        float sx = dstW / (float) srcW;
+        float sy = dstH / (float) srcH;
+        for (int y = 0; y < dstH; y++) {
+            int py = Math.min((int) (y / sy), srcH - 1);
+            for (int x = 0; x < dstW; x++) {
+                int px = Math.min((int) (x / sx), srcW - 1);
+                dst[y * dstW + x] = src[py * srcW + px];
             }
         }
         return dst;
     }
 
     private static float[] resizeBilinear(float[] src, int srcW, int srcH, int dstW, int dstH) {
-        if (srcW==dstW && srcH==dstH) return src.clone();
-        float[] dst = new float[dstW*dstH];
-        float xRatio = dstW>1 ? (srcW-1f)/(dstW-1f):0f;
-        float yRatio = dstH>1 ? (srcH-1f)/(dstH-1f):0f;
-        for (int y=0;y<dstH;y++){
+        if (srcW == dstW && srcH == dstH) return src.clone();
+        float[] dst = new float[dstW * dstH];
+        float xRatio = dstW > 1 ? (srcW - 1f) / (dstW - 1f) : 0f;
+        float yRatio = dstH > 1 ? (srcH - 1f) / (dstH - 1f) : 0f;
+        for (int y = 0; y < dstH; y++) {
             float sy = y * yRatio;
-            int y0 = (int)Math.floor(sy);
-            int y1 = Math.min(y0+1, srcH-1);
+            int y0 = (int) Math.floor(sy);
+            int y1 = Math.min(y0 + 1, srcH - 1);
             float ly = sy - y0;
-            for (int x=0;x<dstW;x++){
+            for (int x = 0; x < dstW; x++) {
                 float sx = x * xRatio;
-                int x0 = (int)Math.floor(sx);
-                int x1 = Math.min(x0+1, srcW-1);
+                int x0 = (int) Math.floor(sx);
+                int x1 = Math.min(x0 + 1, srcW - 1);
                 float lx = sx - x0;
-                float top = lerp(src[y0*srcW + x0], src[y0*srcW + x1], lx);
-                float bottom = lerp(src[y1*srcW + x0], src[y1*srcW + x1], lx);
-                dst[y*dstW + x] = lerp(top, bottom, ly);
+                float top = lerp(src[y0 * srcW + x0], src[y0 * srcW + x1], lx);
+                float bottom = lerp(src[y1 * srcW + x0], src[y1 * srcW + x1], lx);
+                dst[y * dstW + x] = lerp(top, bottom, ly);
             }
         }
         return dst;
     }
 
-    private static float lerp(float a,float b,float t){ return a + (b-a)*t; }
-    private static int clamp(int v,int lo,int hi){ return v<lo?lo:(Math.min(v, hi)); }
-    private static int roundToMultiple(int value,int multiple){
-        if (multiple<=1) return value;
-        int q = Math.round(value/(float)multiple);
-        return Math.max(multiple, q*multiple);
+    private static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+    private static int clamp(int v, int lo, int hi) { return v < lo ? lo : (Math.min(v, hi)); }
+    private static int roundToMultiple(int value, int multiple) {
+        if (multiple <= 1) return value;
+        int q = Math.round(value / (float) multiple);
+        return Math.max(multiple, q * multiple);
     }
 
     private static int clampToRange(int value, int min, int max) {
@@ -293,4 +401,3 @@ public class DepthEstimator implements AutoCloseable {
         sessionOptions.close();
     }
 }
-

@@ -5,6 +5,7 @@ import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
 import android.view.View;
@@ -18,7 +19,6 @@ import androidx.annotation.OptIn;
 import androidx.camera.camera2.interop.Camera2CameraInfo;
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop;
 import androidx.camera.core.Camera;
-import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import ai.onnxruntime.OrtException;
 
@@ -52,8 +53,11 @@ public class MainActivity extends ComponentActivity {
     private static final int REQ = 42;
     private static final String TAG = "MainActivity";
 
+    // Depth throttling / cache
     private static final long DEPTH_INTERVAL_MS = 1500L;
     private static final long DEPTH_CACHE_MS = 3000L;
+
+    // Input blur
     private static final boolean ENABLE_INPUT_BLUR = true;
     private static final int BLUR_RADIUS = 1; // 1 => kernel 3x3
 
@@ -84,13 +88,19 @@ public class MainActivity extends ComponentActivity {
     private StereoDepthProcessor stereoProcessor;
     private ProcessCameraProvider cameraProvider;
     private Camera currentCamera;
+
+    // CameraX analysis executor (single thread)
     private ExecutorService exec;
+    // Inference executor (YOLO + depth in parallel)
+    private ExecutorService inferenceExec;
 
     // ---------------------------------------------------------------------------------------------
     //  Depth & stereo state
     // ---------------------------------------------------------------------------------------------
-    private final DepthPipelineHelper.DepthState depthState =
+    // Reuse your existing helper state holder
+    final DepthPipelineHelper.DepthState depthState =
             new DepthPipelineHelper.DepthState();
+
     private volatile boolean stereoFusionEnabled = false;
     private boolean stereoPipelineAvailable = false;
     private volatile boolean sequentialStereoRunning = false;
@@ -127,7 +137,10 @@ public class MainActivity extends ComponentActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Single-thread CameraX analyzer
         exec = Executors.newSingleThreadExecutor();
+        // Two-thread inference pool: YOLO + depth
+        inferenceExec = Executors.newFixedThreadPool(2);
 
         initViews();
         initPreferencesAndCalibrationKey();
@@ -154,18 +167,19 @@ public class MainActivity extends ComponentActivity {
     protected void onDestroy() {
         super.onDestroy();
         if (exec != null) exec.shutdownNow();
+        if (inferenceExec != null) inferenceExec.shutdownNow();
         if (detector != null) {
             try {
                 detector.close();
             } catch (Exception e) {
-                throw new RuntimeException(e);
+                Log.e(TAG, "Detector close failed", e);
             }
         }
         if (depthEstimator != null) {
             try {
                 depthEstimator.close();
             } catch (Exception e) {
-                throw new RuntimeException(e);
+                Log.e(TAG, "DepthEstimator close failed", e);
             }
         }
         stereoProcessor = null;
@@ -195,7 +209,6 @@ public class MainActivity extends ComponentActivity {
         zoomSeek = findViewById(R.id.seekZoom);
         zoomValue = findViewById(R.id.textZoomValue);
 
-        // use LabelHelper instead of local loadLabels()
         overlay.setLabels(LabelHelper.loadLabels(this, "labels.txt"));
     }
 
@@ -340,7 +353,6 @@ public class MainActivity extends ComponentActivity {
 
         try {
             depthEstimator = new DepthEstimator(this);
-            // Reset depth cache whenever we (re)create the estimator
             depthState.lastDepthMap = null;
             depthState.lastDepthMillis = 0L;
             depthState.lastDepthCacheTime = 0L;
@@ -362,7 +374,6 @@ public class MainActivity extends ComponentActivity {
                         ProcessCameraProvider.getInstance(this).get();
                 cameraProvider = provider;
                 provider.unbindAll();
-                // cache / sort back cameras using helper
                 backCameraInfos = CameraUtils.cacheBackCameraInfos(provider);
                 bindCameraUseCases();
             } catch (Throwable e) {
@@ -429,6 +440,46 @@ public class MainActivity extends ComponentActivity {
         }
     }
 
+    /**
+     * Runs depth estimation if the interval has passed, otherwise returns cached depth.
+     * Thread-safe; can be called from background threads.
+     */
+    private DepthEstimator.DepthMap maybeRunDepthSync(
+            int[] argb,
+            int width,
+            int height,
+            long nowMs
+    ) {
+        if (depthEstimator == null) return null;
+
+        synchronized (depthState) {
+            boolean hasDepth = (depthState.lastDepthMap != null);
+            boolean tooSoon = (nowMs - depthState.lastDepthMillis) < DEPTH_INTERVAL_MS;
+            boolean cacheValid = hasDepth &&
+                    (nowMs - depthState.lastDepthCacheTime) <= DEPTH_CACHE_MS;
+
+            if (tooSoon && cacheValid) {
+                depthState.lastDepthCacheTime = nowMs;
+                return depthState.lastDepthMap;
+            }
+        }
+
+        try {
+            DepthEstimator.DepthMap map =
+                    depthEstimator.estimate(argb, width, height);
+
+            synchronized (depthState) {
+                depthState.lastDepthMap = map;
+                depthState.lastDepthMillis = nowMs;
+                depthState.lastDepthCacheTime = nowMs;
+            }
+            return map;
+        } catch (Exception e) {
+            Log.e(TAG, "Depth estimation failed", e);
+            return null;
+        }
+    }
+
     private void analyzeFrame(ImageProxy image) {
         boolean singleShotFrame = false;
         try {
@@ -439,16 +490,19 @@ public class MainActivity extends ComponentActivity {
                 singleShotFrame = true;
                 shouldProcess = true;
                 if (stereoFusionEnabled && !stereoPipelineAvailable) {
-                    singleShotFrame = false; // handled inside fallback
+                    singleShotFrame = false;
                     handleSequentialDualShot();
                     return;
                 }
             }
             if (!shouldProcess) return;
 
+            // Basic frame info
             int frameW = image.getWidth();
             int frameH = image.getHeight();
             int rotation = image.getImageInfo().getRotationDegrees();
+
+            // YUV → ARGB (+ rotation)
             int[] argb = Yuv.toArgb(image);
             if (rotation != 0) {
                 argb = Yuv.rotate(argb, frameW, frameH, rotation);
@@ -467,28 +521,49 @@ public class MainActivity extends ComponentActivity {
                     ? ImageUtils.boxBlur(argb, frameW, frameH, BLUR_RADIUS)
                     : argb;
 
-            List<ObjectDetector.Detection> dets =
-                    detector.detect(detectorInput, frameW, frameH);
+            final long nowMs = SystemClock.elapsedRealtime();
 
-            // ---- Depth pipeline via helper ----
-            DepthPipelineHelper.DepthResult depthResult =
-                    DepthPipelineHelper.maybeRunDepth(
-                            depthEstimator,
-                            depthState,
-                            argb,
-                            frameW,
-                            frameH,
-                            dets,
-                            DEPTH_INTERVAL_MS,
-                            DEPTH_CACHE_MS
-                    );
-            dets = depthResult.dets;
-            DepthEstimator.DepthMap depthForFusion = depthResult.depthMap;
-            // -----------------------------------
+            // Run YOLO + depth in parallel on inferenceExec
+            int finalFrameW1 = frameW;
+            int finalFrameH1 = frameH;
+            Future<List<ObjectDetector.Detection>> detFuture =
+                    inferenceExec.submit(() -> {
+                        try {
+                            return detector.detect(detectorInput, finalFrameW1, finalFrameH1);
+                        } catch (OrtException e) {
+                            Log.e(TAG, "detect failed", e);
+                            return null;
+                        } catch (Throwable t) {
+                            Log.e(TAG, "detect crashed", t);
+                            return null;
+                        }
+                    });
+
+            Future<DepthEstimator.DepthMap> depthFuture = null;
+            if (depthEstimator != null) {
+                int[] finalArgb = argb;
+                int finalFrameW = frameW;
+                int finalFrameH = frameH;
+                depthFuture = inferenceExec.submit(() ->
+                        maybeRunDepthSync(finalArgb, finalFrameW, finalFrameH, nowMs)
+                );
+            }
+
+            // Wait for results
+            List<ObjectDetector.Detection> dets = detFuture.get();
+
+            DepthEstimator.DepthMap depthMap = null;
+            if (depthFuture != null) {
+                depthMap = depthFuture.get();
+            }
+
+            if (depthMap != null && dets != null) {
+                dets = depthEstimator.attachDepth(dets, depthMap);
+            }
 
             if (stereoFusionEnabled && stereoProcessor != null
-                    && depthForFusion != null && dets != null) {
-                dets = stereoProcessor.fuseDepth(depthForFusion, dets, frameW, frameH);
+                    && depthMap != null && dets != null) {
+                dets = stereoProcessor.fuseDepth(depthMap, dets, frameW, frameH);
             }
 
             int finalW = frameW;
@@ -496,8 +571,9 @@ public class MainActivity extends ComponentActivity {
             List<ObjectDetector.Detection> finalDets = dets;
             runOnUiThread(() -> overlay.setDetections(finalDets, finalW, finalH));
 
-        } catch (OrtException t) {
-            Log.e(TAG, "detect failed", t);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Log.w(TAG, "analyzeFrame interrupted", e);
         } catch (Throwable t) {
             Log.e(TAG, "analyzer crash", t);
         } finally {
@@ -534,7 +610,7 @@ public class MainActivity extends ComponentActivity {
     }
 
     // ---------------------------------------------------------------------------------------------
-    //  Stereo single-shot pipeline (via SequentialStereoHelper)
+    //  Stereo single-shot pipeline
     // ---------------------------------------------------------------------------------------------
     private void handleSequentialDualShot() {
         if (cameraProvider == null) {
@@ -580,7 +656,6 @@ public class MainActivity extends ComponentActivity {
                     @Override
                     public void onResult(SequentialStereoHelper.Result result) {
                         if (result == null || result.detections == null) return;
-                        // Result.detections is already fused if stereoFusionEnabled was true.
                         overlay.setDetections(
                                 result.detections,
                                 result.width,
@@ -600,7 +675,6 @@ public class MainActivity extends ComponentActivity {
                         if (detectOnceButton != null) {
                             detectOnceButton.setEnabled(true);
                         }
-                        // Restore normal camera pipeline
                         bindCameraUseCases();
                     }
                 }
@@ -620,18 +694,13 @@ public class MainActivity extends ComponentActivity {
         );
     }
 
-    private void updateCalibrationLabel(float scale) {
-        if (calibrationValue == null) return;
-        calibrationValue.setText(
-                getString(R.string.depth_calibration_value, scale));
-    }
-
     private void updateDepthModeLabel() {
         if (depthModeText == null) return;
         boolean stereoActive = stereoFusionEnabled
                 && stereoPipelineAvailable
                 && stereoProcessor != null;
-        depthModeText.setText(getString(stereoActive ? R.string.depth_mode_stereo : R.string.depth_mode_mono));
+        depthModeText.setText(getString(
+                stereoActive ? R.string.depth_mode_stereo : R.string.depth_mode_mono));
     }
 
     private void updateStereoSwitchAvailability(boolean available) {
@@ -693,8 +762,6 @@ public class MainActivity extends ComponentActivity {
                     zoomMinRatio,
                     zoomMaxRatio
             );
-            // This will trigger onProgressChanged with fromUser = false,
-            // so the ZoomHelper listener will ignore it and avoid feedback loops.
             zoomSeek.setProgress(progress);
             zoomValue.setText(getString(R.string.zoom_value, state.getZoomRatio()));
         });
