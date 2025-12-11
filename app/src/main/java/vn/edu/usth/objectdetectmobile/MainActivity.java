@@ -45,8 +45,50 @@ import java.util.concurrent.Future;
 
 import ai.onnxruntime.OrtException;
 
-public class MainActivity extends ComponentActivity {
+import android.content.Intent;
+import android.net.Uri;
+import androidx.appcompat.app.AlertDialog;
 
+import android.app.DownloadManager;
+import android.os.Environment;
+import android.database.Cursor;
+
+import android.os.Build;
+import android.content.Context;
+import android.content.IntentFilter;
+
+
+public class MainActivity extends ComponentActivity {
+    // ---------------------------------------------------------------------------------------------
+    //  Environment mode (indoor / outdoor)
+    // ---------------------------------------------------------------------------------------------
+    public enum EnvMode {
+        INDOOR,
+        OUTDOOR
+    }
+    // -----------------------------------------------------------------------------------------
+    //  Model download URLs (GitHub Pages)
+    // -----------------------------------------------------------------------------------------
+    // Base folder chứa 2 model indoor/outdoor
+    private static final String DEPTH_DOWNLOAD_INDOOR_URL =
+            "https://haidreamer.github.io/models_mobile_app_gp_for_visually_impaired/depth_anything_v2_metric_hypersim_vits_fp16.onnx";
+
+    private static final String DEPTH_DOWNLOAD_OUTDOOR_URL =
+            "https://haidreamer.github.io/models_mobile_app_gp_for_visually_impaired/depth_anything_v2_metric_vkitti_vits_fp16.onnx";
+
+    // Lưu thông tin tải depth model
+    private static final String PREF_DEPTH_MODEL_INDOOR_PATH  = "pref_depth_model_indoor_path";
+    private static final String PREF_DEPTH_MODEL_OUTDOOR_PATH = "pref_depth_model_outdoor_path";
+    private static final String PREF_LAST_DEPTH_DOWNLOAD_ID   = "pref_last_depth_download_id";
+    private static final String PREF_LAST_DEPTH_DOWNLOAD_MODE = "pref_last_depth_download_mode";
+    // Depth model prefs live in a separate file
+    private static final String DEPTH_MODEL_PREFS = "depth_models";
+    private SharedPreferences depthModelPrefs;
+
+    private static final String PREF_ENV_MODE = "pref_env_mode";
+
+    private EnvMode envMode = EnvMode.INDOOR;  // default = Indoor
+    private SwitchMaterial environmentSwitch;
     // ---------------------------------------------------------------------------------------------
     //  Constants
     // ---------------------------------------------------------------------------------------------
@@ -136,14 +178,29 @@ public class MainActivity extends ComponentActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        depthModelPrefs = getSharedPreferences(DEPTH_MODEL_PREFS, MODE_PRIVATE);
 
         // Single-thread CameraX analyzer
         exec = Executors.newSingleThreadExecutor();
         // Two-thread inference pool: YOLO + depth
         inferenceExec = Executors.newFixedThreadPool(2);
-
         initViews();
         initPreferencesAndCalibrationKey();
+
+        IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ requires flags: exported vs not exported
+            ContextCompat.registerReceiver(
+                    this,
+                    downloadReceiver,
+                    filter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+            );
+        } else {
+            // Old behavior
+            registerReceiver(downloadReceiver, filter);
+        }
+
         initControls();
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -182,6 +239,9 @@ public class MainActivity extends ComponentActivity {
                 Log.e(TAG, "DepthEstimator close failed", e);
             }
         }
+        try {
+            unregisterReceiver(downloadReceiver);
+        } catch (Exception ignore) {}
         stereoProcessor = null;
         // Clear depth cache state
         depthState.lastDepthMap = null;
@@ -208,12 +268,15 @@ public class MainActivity extends ComponentActivity {
         calibrationValue = findViewById(R.id.textCalibrationValue);
         zoomSeek = findViewById(R.id.seekZoom);
         zoomValue = findViewById(R.id.textZoomValue);
+        environmentSwitch = findViewById(R.id.switchEnvironment);
 
         overlay.setLabels(LabelHelper.loadLabels(this, "labels.txt"));
     }
 
     private void initPreferencesAndCalibrationKey() {
         prefs = DepthCalibrationHelper.getPrefs(this);
+
+        // Calibration
         calibrationPrefKey = DepthCalibrationHelper.buildCalibrationKey(this);
         calibrationScale = DepthCalibrationHelper.loadSavedCalibrationScale(
                 prefs,
@@ -221,7 +284,21 @@ public class MainActivity extends ComponentActivity {
                 DepthEstimator.getUserScale()
         );
         DepthEstimator.setUserScale(calibrationScale);
+
+        // Environment mode (load từ prefs, default = INDOOR)
+        String savedEnv = prefs.getString(PREF_ENV_MODE, EnvMode.INDOOR.name());
+        try {
+            envMode = EnvMode.valueOf(savedEnv);
+        } catch (IllegalArgumentException e) {
+            envMode = EnvMode.INDOOR;
+        }
+
+        // Sync với UI switch (ON = OUTDOOR, OFF = INDOOR)
+        if (environmentSwitch != null) {
+            environmentSwitch.setChecked(envMode == EnvMode.OUTDOOR);
+        }
     }
+
 
     private void initControls() {
         initRealtimeSwitch();
@@ -229,6 +306,7 @@ public class MainActivity extends ComponentActivity {
         initDualShotButton();
         initBlurSwitch();
         initStereoSwitch();
+        initEnvironmentSwitch();
         initSettingsButton();
         initFlipCameraButton();
         setupCalibrationControls();
@@ -298,6 +376,97 @@ public class MainActivity extends ComponentActivity {
         });
     }
 
+    private void initEnvironmentSwitch() {
+        if (environmentSwitch == null) return;
+
+        // Sync lại trạng thái hiện tại (phòng khi initEnvMode gọi sau)
+        environmentSwitch.setChecked(envMode == EnvMode.OUTDOOR);
+
+        environmentSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            // ON = OUTDOOR, OFF = INDOOR
+            envMode = isChecked ? EnvMode.OUTDOOR : EnvMode.INDOOR;
+
+            // Lưu vào prefs
+            prefs.edit().putString(PREF_ENV_MODE, envMode.name()).apply();
+
+            Toast.makeText(
+                    this,
+                    "Environment: " + (envMode == EnvMode.OUTDOOR ? "Outdoor" : "Indoor"),
+                    Toast.LENGTH_SHORT
+            ).show();
+
+            // Đơn giản: reload lại detector/depth cho mode mới
+            reloadPipelinesForEnvChange();
+        });
+    }
+
+    private void reloadPipelinesForEnvChange() {
+        // Pause realtime so we don't process frames while reloading depth
+        realtimeEnabled = false;
+
+        runOnUiThread(() -> {
+            Log.i(TAG, "Reloading depth pipeline for envMode = " + envMode);
+
+            // 1) Check if we have ANY model for this mode (asset or downloaded)
+            boolean depthModelOk = DepthEstimator.isModelAvailable(this, envMode);
+            if (!depthModelOk) {
+                // No model yet -> show download dialog for this mode
+                showMissingDepthModelDialog();
+
+                // Keep depthEstimator = null, YOLO-only mode
+                depthEstimator = null;
+                synchronized (depthState) {
+                    depthState.lastDepthMap = null;
+                    depthState.lastDepthMillis = 0L;
+                    depthState.lastDepthCacheTime = 0L;
+                }
+
+                // Re-enable realtime (but without depth)
+                realtimeEnabled = true;
+                return;
+            }
+
+            // 2) We DO have a model (asset or downloaded) -> try to create DepthEstimator
+            try {
+                DepthEstimator newDepth = new DepthEstimator(this, envMode);
+                depthEstimator = newDepth;
+
+                synchronized (depthState) {
+                    depthState.lastDepthMap = null;
+                    depthState.lastDepthMillis = 0L;
+                    depthState.lastDepthCacheTime = 0L;
+                }
+
+                Toast.makeText(
+                        this,
+                        "Depth model loaded for " +
+                                (envMode == EnvMode.OUTDOOR ? "Outdoor" : "Indoor"),
+                        Toast.LENGTH_SHORT
+                ).show();
+
+            } catch (Throwable e) {
+                Log.w(TAG, "Depth estimator re-init failed", e);
+                depthEstimator = null;
+                synchronized (depthState) {
+                    depthState.lastDepthMap = null;
+                    depthState.lastDepthMillis = 0L;
+                    depthState.lastDepthCacheTime = 0L;
+                }
+                Toast.makeText(
+                        this,
+                        "Failed to init depth for " +
+                                (envMode == EnvMode.OUTDOOR ? "Outdoor" : "Indoor"),
+                        Toast.LENGTH_LONG
+                ).show();
+            }
+
+            // Re-enable realtime (with or without depth depending on success)
+            realtimeEnabled = true;
+        });
+    }
+
+
+
     private void initSettingsButton() {
         if (settingsButton == null) {
             applySettingsVisibility(true);
@@ -351,8 +520,23 @@ public class MainActivity extends ComponentActivity {
             return;
         }
 
+        // --- NEW: kiểm tra depth model có trong assets hay chưa ---
+        boolean depthModelOk = DepthEstimator.isModelAvailable(this, envMode);
+        if (!depthModelOk) {
+            // Không có model -> thông báo & gợi ý mở link download
+            showMissingDepthModelDialog();
+            // Không tạo depthEstimator, app vẫn chạy YOLO-only
+            depthEstimator = null;
+            depthState.lastDepthMap = null;
+            depthState.lastDepthMillis = 0L;
+            depthState.lastDepthCacheTime = 0L;
+            stereoProcessor = null;
+            updateStereoSwitchAvailability(false);
+            return;
+        }
+
         try {
-            depthEstimator = new DepthEstimator(this);
+            depthEstimator = new DepthEstimator(this, envMode);
             depthState.lastDepthMap = null;
             depthState.lastDepthMillis = 0L;
             depthState.lastDepthCacheTime = 0L;
@@ -367,6 +551,187 @@ public class MainActivity extends ComponentActivity {
         updateStereoSwitchAvailability(false);
     }
 
+    private void showMissingDepthModelDialog() {
+        String modeLabel = (envMode == EnvMode.OUTDOOR) ? "Outdoor" : "Indoor";
+
+        String downloadUrl = (envMode == EnvMode.OUTDOOR)
+                ? DEPTH_DOWNLOAD_OUTDOOR_URL
+                : DEPTH_DOWNLOAD_INDOOR_URL;
+
+        new AlertDialog.Builder(this)
+                .setTitle("Depth model missing")
+                .setMessage(
+                        "Depth model for " + modeLabel + " mode is not available inside the app.\n\n" +
+                                "Do you want to download it now?"
+                )
+                .setPositiveButton("Download", (dialog, which) -> {
+                    startDepthModelDownload(downloadUrl, envMode);
+                })
+                .setNegativeButton("Cancel", (dialog, which) -> {
+                    Toast.makeText(this,
+                            "Running without depth estimation",
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setCancelable(true)
+                .show();
+    }
+
+    private void startDepthModelDownload(String url, EnvMode mode) {
+        DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+        if (dm == null) {
+            Toast.makeText(this, "DownloadManager not available", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        java.io.File outFile = getDepthModelFileForMode(mode);
+        if (outFile == null) {
+            Toast.makeText(this, "No external files dir for downloads", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        String fileName = outFile.getName();
+
+        DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url))
+                .setTitle("Downloading " + fileName)
+                .setDescription("Depth model for " + (mode == EnvMode.OUTDOOR ? "Outdoor" : "Indoor"))
+                .setNotificationVisibility(
+                        DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                // We know exactly where the file will be:
+                .setDestinationInExternalFilesDir(
+                        this,
+                        Environment.DIRECTORY_DOWNLOADS,
+                        fileName
+                );
+
+        long id = dm.enqueue(req);
+
+        String keyPath = (mode == EnvMode.OUTDOOR)
+                ? PREF_DEPTH_MODEL_OUTDOOR_PATH
+                : PREF_DEPTH_MODEL_INDOOR_PATH;
+
+        // Save: which download, which mode, and where we expect the file to be
+        depthModelPrefs.edit()
+                .putLong(PREF_LAST_DEPTH_DOWNLOAD_ID, id)
+                .putString(PREF_LAST_DEPTH_DOWNLOAD_MODE, mode.name())
+                .putString(keyPath, outFile.getAbsolutePath())
+                .apply();
+
+        Toast.makeText(this, "Downloading depth model...", Toast.LENGTH_SHORT).show();
+    }
+
+    private final android.content.BroadcastReceiver downloadReceiver =
+            new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(android.content.Context ctx, Intent intent) {
+                    if (!DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(intent.getAction())) {
+                        return;
+                    }
+
+                    long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+                    long expectedId = depthModelPrefs.getLong(PREF_LAST_DEPTH_DOWNLOAD_ID, -1L);
+                    if (id != expectedId) return; // Not our download
+
+                    DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                    if (dm == null) return;
+
+                    DownloadManager.Query q = new DownloadManager.Query().setFilterById(id);
+                    try (Cursor c = dm.query(q)) {
+                        if (c != null && c.moveToFirst()) {
+                            int statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS);
+                            if (statusIdx == -1) return;
+
+                            int status = c.getInt(statusIdx);
+                            if (status == DownloadManager.STATUS_SUCCESSFUL) {
+
+                                // Which mode was this download for?
+                                String modeName = depthModelPrefs.getString(
+                                        PREF_LAST_DEPTH_DOWNLOAD_MODE,
+                                        EnvMode.INDOOR.name()
+                                );
+                                final EnvMode mode = EnvMode.valueOf(modeName);
+
+                                String keyPath = (mode == EnvMode.OUTDOOR)
+                                        ? PREF_DEPTH_MODEL_OUTDOOR_PATH
+                                        : PREF_DEPTH_MODEL_INDOOR_PATH;
+
+                                final String path = depthModelPrefs.getString(keyPath, null);
+
+                                if (path != null && new java.io.File(path).exists()) {
+                                    Log.i(TAG, "Depth model downloaded OK for mode=" + mode +
+                                            " at " + path);
+
+                                    runOnUiThread(() -> {
+                                        try {
+                                            // Make sure envMode matches the model we just downloaded
+                                            envMode = mode;
+
+                                            // If you want the UI switch to reflect this:
+                                            if (environmentSwitch != null) {
+                                                environmentSwitch.setChecked(envMode == EnvMode.OUTDOOR);
+                                            }
+
+                                            // Create a new DepthEstimator pointing to this file
+                                            depthEstimator = new DepthEstimator(MainActivity.this, envMode);
+
+                                            synchronized (depthState) {
+                                                depthState.lastDepthMap = null;
+                                                depthState.lastDepthMillis = 0L;
+                                                depthState.lastDepthCacheTime = 0L;
+                                            }
+
+                                            Toast.makeText(
+                                                    MainActivity.this,
+                                                    "Depth model loaded for " +
+                                                            (envMode == EnvMode.OUTDOOR ? "Outdoor" : "Indoor"),
+                                                    Toast.LENGTH_SHORT
+                                            ).show();
+
+                                        } catch (Throwable e) {
+                                            Log.w(TAG, "Failed to init depth after download", e);
+                                            depthEstimator = null;
+                                            synchronized (depthState) {
+                                                depthState.lastDepthMap = null;
+                                                depthState.lastDepthMillis = 0L;
+                                                depthState.lastDepthCacheTime = 0L;
+                                            }
+                                            Toast.makeText(
+                                                    MainActivity.this,
+                                                    "Depth model downloaded but failed to init",
+                                                    Toast.LENGTH_LONG
+                                            ).show();
+                                        }
+                                    });
+
+                                } else {
+                                    Log.w(TAG, "Depth model download reported success but file missing at " + path);
+                                    Toast.makeText(MainActivity.this,
+                                            "Depth model file missing after download",
+                                            Toast.LENGTH_LONG).show();
+                                }
+
+                            } else {
+                                Toast.makeText(MainActivity.this,
+                                        "Depth model download failed",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error checking download status", e);
+                    }
+                }
+            };
+
+
+
+    private java.io.File getDepthModelFileForMode(EnvMode mode) {
+        String fileName = (mode == EnvMode.OUTDOOR)
+                ? "depth_anything_v2_metric_vkitti_vits_fp16.onnx"
+                : "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
+
+        java.io.File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) return null;
+        return new java.io.File(dir, fileName);
+    }
     private void initCameraProvider() {
         ProcessCameraProvider.getInstance(this).addListener(() -> {
             try {
@@ -482,7 +847,7 @@ public class MainActivity extends ComponentActivity {
 
     private void analyzeFrame(ImageProxy image) {
         boolean singleShotFrame = false;
-        try {
+        try {   
             boolean shouldProcess = realtimeEnabled;
             if (!shouldProcess && singleShotRequested && !singleShotRunning) {
                 singleShotRequested = false;

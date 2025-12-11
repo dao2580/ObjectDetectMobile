@@ -101,6 +101,17 @@
             android:textColor="@android:color/white"
             android:checked="false" />
 
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchEnvironment"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/environment_mode"
+            android:textOn="@string/environment_mode_outdoor"
+            android:textOff="@string/environment_mode_indoor"
+            android:textColor="@android:color/white"
+            android:checked="false" />
+
         <TextView
             android:id="@+id/textCalibrationTitle"
             android:layout_width="wrap_content"

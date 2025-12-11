@@ -56,12 +56,7 @@ public class ObjectDetector implements AutoCloseable {
         String modelPath = Util.cacheAsset(ctx, "yolov8m_compatible.onnx");
 
         OrtSession.SessionOptions so = new OrtSession.SessionOptions();
-        // Optional: enable NNAPI on supported devices (falls back to CPU if not available)
-        try {
-            so.addNnapi();
-        } catch (Exception e) {
-            android.util.Log.w("ObjectDetector", "NNAPI not available, using CPU", e);
-        }
+        // NO enable NNAPI on supported devices (falls back to CPU if not available)
         // (Optional) tune threads & optimization if you want:
         // so.setIntraOpNumThreads(1);
         // so.setInterOpNumThreads(1);

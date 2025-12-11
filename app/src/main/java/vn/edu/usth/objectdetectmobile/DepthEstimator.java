@@ -1,9 +1,14 @@
 package vn.edu.usth.objectdetectmobile;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.res.AssetManager;
 import androidx.annotation.NonNull;
 import android.util.Log;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -23,7 +28,51 @@ import ai.onnxruntime.OrtSession;
  */
 public class DepthEstimator implements AutoCloseable {
     private static final String TAG = "DepthEstimator";
-    private static final String MODEL_NAME = "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
+    private static final String DEPTH_MODEL_PREFS = "depth_models";
+    private static final String MODEL_NAME_INDOOR  =
+            "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
+    private static final String MODEL_NAME_OUTDOOR =
+            "depth_anything_v2_metric_vkitti_vits_fp16.onnx";
+
+    // Keys MUST match MainActivity's PREF_* strings
+    private static final String PREF_DEPTH_MODEL_INDOOR_PATH  = "pref_depth_model_indoor_path";
+    private static final String PREF_DEPTH_MODEL_OUTDOOR_PATH = "pref_depth_model_outdoor_path";
+
+    // Kiểm tra xem đã có model usable cho mode hiện tại chưa
+    // ƯU TIÊN: asset trong app  → nếu không có thì mới check file đã tải.
+    public static boolean isModelAvailable(@NonNull Context ctx,
+                                           @NonNull MainActivity.EnvMode mode) {
+        String modelName = (mode == MainActivity.EnvMode.OUTDOOR)
+                ? MODEL_NAME_OUTDOOR
+                : MODEL_NAME_INDOOR;
+
+        // 1) asset?
+        AssetManager am = ctx.getAssets();
+        try (InputStream is = am.open(modelName)) {
+            Log.i(TAG, "Depth model asset FOUND: " + modelName);
+            return true;
+        } catch (IOException e) {
+            Log.w(TAG, "Depth model asset missing: " + modelName);
+        }
+
+        // 2) downloaded file?
+        SharedPreferences sp =
+                ctx.getSharedPreferences(DEPTH_MODEL_PREFS, Context.MODE_PRIVATE);
+        String prefKey = (mode == MainActivity.EnvMode.OUTDOOR)
+                ? PREF_DEPTH_MODEL_OUTDOOR_PATH
+                : PREF_DEPTH_MODEL_INDOOR_PATH;
+
+        String downloadedPath = sp.getString(prefKey, null);
+        if (downloadedPath != null && new java.io.File(downloadedPath).exists()) {
+            Log.i(TAG, "Depth model downloaded file FOUND: " + downloadedPath);
+            return true;
+        }
+
+        Log.w(TAG, "No depth model available for mode=" + mode);
+        return false;
+    }
+
+
     private static final boolean LOG_RAW_DEPTH = true;
 
     public static class DepthMap {
@@ -85,11 +134,48 @@ public class DepthEstimator implements AutoCloseable {
     private final float[] mean = {0.485f, 0.456f, 0.406f};
     private final float[] std = {0.229f, 0.224f, 0.225f};
 
-    public DepthEstimator(@NonNull Context ctx) throws OrtException {
+    public DepthEstimator(@NonNull Context ctx,
+                          @NonNull MainActivity.EnvMode mode) throws OrtException {
         env = OrtEnvironment.getEnvironment();
-        modelPath = ObjectDetector.Util.cacheAsset(ctx, MODEL_NAME);
+
+        String modelName = (mode == MainActivity.EnvMode.OUTDOOR)
+                ? MODEL_NAME_OUTDOOR
+                : MODEL_NAME_INDOOR;
+
+        String finalModelPath;
+
+        // 1) Prefer asset if present
+        boolean assetExists;
+        try (InputStream is = ctx.getAssets().open(modelName)) {
+            assetExists = true;
+        } catch (IOException e) {
+            assetExists = false;
+        }
+
+        if (assetExists) {
+            finalModelPath = ObjectDetector.Util.cacheAsset(ctx, modelName);
+            Log.i(TAG, "Using depth model asset: " + modelName);
+        } else {
+            // 2) otherwise use downloaded file
+            SharedPreferences sp =
+                    ctx.getSharedPreferences(DEPTH_MODEL_PREFS, Context.MODE_PRIVATE);
+            String prefKey = (mode == MainActivity.EnvMode.OUTDOOR)
+                    ? PREF_DEPTH_MODEL_OUTDOOR_PATH
+                    : PREF_DEPTH_MODEL_INDOOR_PATH;
+            String downloadedPath = sp.getString(prefKey, null);
+
+            if (downloadedPath != null && new java.io.File(downloadedPath).exists()) {
+                finalModelPath = downloadedPath;
+                Log.i(TAG, "Using downloaded depth model: " + downloadedPath);
+            } else {
+                throw new IllegalStateException("No depth model found for mode=" + mode);
+            }
+        }
+
+        modelPath = finalModelPath;
         sessionOptions = new OrtSession.SessionOptions();
     }
+
 
     public List<ObjectDetector.Detection> attachDepth(List<ObjectDetector.Detection> dets,
                                                       DepthMap depthMap) {
@@ -123,8 +209,11 @@ public class DepthEstimator implements AutoCloseable {
             }
         }
 
-        float[] cropped = crop(rawDepth, rawW, rawH, prep.padX, prep.padY, prep.contentW, prep.contentH);
-        float[] depthFull = resizeBilinear(cropped, prep.contentW, prep.contentH, srcW, srcH);
+        float[] cropped = crop(rawDepth, rawW, rawH,
+                prep.padX, prep.padY, prep.contentW, prep.contentH);
+        float[] depthFull = resizeBilinear(
+                cropped, prep.contentW, prep.contentH, srcW, srcH);
+
         float min = Float.MAX_VALUE, max = -Float.MAX_VALUE;
         for (float v : depthFull) {
             if (v < min) min = v;
@@ -133,10 +222,9 @@ public class DepthEstimator implements AutoCloseable {
         return new DepthMap(depthFull, srcW, srcH, min, max);
     }
 
-    // NEW: decide which boxes should use the "bottom" region (tune IDs for your model)
+    // --- existing helper methods below unchanged ---
+
     private static boolean isBottomRegionClass(int cls) {
-        // Example for COCO-style IDs; change according to your dataset:
-        // 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck, ...
         switch (cls) {
             case 1: // bicycle
             case 2: // car
@@ -149,14 +237,15 @@ public class DepthEstimator implements AutoCloseable {
         }
     }
 
-    // returns raw depth (model units).
-    private static float sampleDangerRegionRaw(DepthMap map, ObjectDetector.Detection d, float frac, DangerRegionMode mode) {
+    private static float sampleDangerRegionRaw(DepthMap map,
+                                               ObjectDetector.Detection d,
+                                               float frac,
+                                               DangerRegionMode mode) {
         if (map.width == 0 || map.height == 0) return Float.NaN;
 
         int W = map.width;
         int H = map.height;
 
-        // Clamp bbox to image bounds
         int x1 = clamp((int) Math.floor(d.x1), 0, W - 1);
         int y1 = clamp((int) Math.floor(d.y1), 0, H - 1);
         int x2 = clamp((int) Math.ceil(d.x2), 0, W);
@@ -171,14 +260,11 @@ public class DepthEstimator implements AutoCloseable {
         int sx1, sy1, sx2, sy2;
 
         if (mode == DangerRegionMode.BOTTOM) {
-            // Bottom band: height = frac * h
             int ch = (int) (h * frac);
             if (ch <= 0) return Float.NaN;
 
-            // Vertical range: bottom frac of the box
             int yStart = Math.max(y1, y2 - ch);
 
-            // Central 50% of width
             int centerBandWidth = (int) (w * 0.5f);
             if (centerBandWidth <= 0) return Float.NaN;
 
@@ -190,9 +276,8 @@ public class DepthEstimator implements AutoCloseable {
             sx1 = xStart;
             sx2 = xEnd;
             sy1 = yStart;
-            sy2 = y2;   // bottom of box
+            sy2 = y2;
         } else {
-            // CENTER mode: central frac of width and height
             int cw = (int) (w * frac);
             int ch = (int) (h * frac);
             if (cw <= 0 || ch <= 0) return Float.NaN;
@@ -222,7 +307,6 @@ public class DepthEstimator implements AutoCloseable {
         float[] vals = new float[capacity];
         int n = 0;
 
-        // Collect all valid (>0) depth values in the region
         for (int y = sy1; y < sy2; y++) {
             int base = y * W;
             for (int x = sx1; x < sx2; x++) {
@@ -235,7 +319,6 @@ public class DepthEstimator implements AutoCloseable {
 
         if (n == 0) return Float.NaN;
 
-        // Nearest point (minimum positive depth) in vals[0..n)
         float nearest = Float.MAX_VALUE;
         for (int i = 0; i < n; i++) {
             float v = vals[i];
@@ -244,17 +327,12 @@ public class DepthEstimator implements AutoCloseable {
             }
         }
 
-        if (nearest == Float.MAX_VALUE) {
-            return Float.NaN;
-        }
-
-        return nearest;
+        return (nearest == Float.MAX_VALUE) ? Float.NaN : nearest;
     }
 
     private static float minDepth(DepthMap map, ObjectDetector.Detection d) {
         if (map == null || map.width == 0 || map.height == 0) return Float.NaN;
 
-        // Decide region mode based on class
         DangerRegionMode mode = isBottomRegionClass(d.cls)
                 ? DangerRegionMode.BOTTOM
                 : DangerRegionMode.CENTER;
@@ -308,8 +386,10 @@ public class DepthEstimator implements AutoCloseable {
         int longest = Math.max(srcW, srcH);
         float scale = target / (float) longest;
 
-        int scaledW = clampToRange(roundToMultiple(Math.round(srcW * scale), multiple), multiple, target);
-        int scaledH = clampToRange(roundToMultiple(Math.round(srcH * scale), multiple), multiple, target);
+        int scaledW = clampToRange(
+                roundToMultiple(Math.round(srcW * scale), multiple), multiple, target);
+        int scaledH = clampToRange(
+                roundToMultiple(Math.round(srcH * scale), multiple), multiple, target);
         int[] scaled = resizeNearest(argb, srcW, srcH, scaledW, scaledH);
 
         int padX = Math.max(0, (target - scaledW) / 2);
@@ -349,7 +429,8 @@ public class DepthEstimator implements AutoCloseable {
         return dst;
     }
 
-    private static float[] resizeBilinear(float[] src, int srcW, int srcH, int dstW, int dstH) {
+    private static float[] resizeBilinear(float[] src, int srcW, int srcH,
+                                          int dstW, int dstH) {
         if (srcW == dstW && srcH == dstH) return src.clone();
         float[] dst = new float[dstW * dstH];
         float xRatio = dstW > 1 ? (srcW - 1f) / (dstW - 1f) : 0f;
@@ -372,19 +453,23 @@ public class DepthEstimator implements AutoCloseable {
         return dst;
     }
 
-    private static float lerp(float a, float b, float t) { return a + (b - a) * t; }
-    private static int clamp(int v, int lo, int hi) { return v < lo ? lo : (Math.min(v, hi)); }
+    private static float lerp(float a, float b, float t) {
+        return a + (b - a) * t;
+    }
+    private static int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : Math.min(v, hi);
+    }
     private static int roundToMultiple(int value, int multiple) {
         if (multiple <= 1) return value;
         int q = Math.round(value / (float) multiple);
         return Math.max(multiple, q * multiple);
     }
-
     private static int clampToRange(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
     }
 
-    private static float[] crop(float[] src, int srcW, int srcH, int offsetX, int offsetY, int outW, int outH) {
+    private static float[] crop(float[] src, int srcW, int srcH,
+                                int offsetX, int offsetY, int outW, int outH) {
         if (offsetX == 0 && offsetY == 0 && outW == srcW && outH == srcH) {
             return src.clone();
         }
