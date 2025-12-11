@@ -25,4 +25,7 @@
     <string name="zoom_value_default">Zoom x1.00</string>
     <string name="dual_shot">Dual shot</string>
     <string name="zoom_not_supported">Zoom not suppported\n</string>
+    <string name="environment_mode">"Envrionment Mode "</string>
+    <string name="environment_mode_indoor">Indoor mode</string>
+    <string name="environment_mode_outdoor">Outdoor mode</string>
 </resources>
