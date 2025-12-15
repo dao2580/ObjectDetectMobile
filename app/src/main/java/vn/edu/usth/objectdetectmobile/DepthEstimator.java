@@ -29,11 +29,13 @@ public class DepthEstimator implements AutoCloseable {
     private static final String TAG = "DepthEstimator";
     private static final String DEPTH_MODEL_PREFS = "depth_models";
     private static final String MODEL_NAME_INDOOR  = "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
-    private static final String MODEL_NAME_OUTDOOR = "tempDONTUSE_depth_anything_v2_metric_vkitti_vits_fp16.onnx";
+    private static final String MODEL_NAME_OUTDOOR = "depth_anything_v2_metric_vkitti_vits_fp16.onnx";
 
     // Keys MUST match MainActivity's PREF_* strings
     private static final String PREF_DEPTH_MODEL_INDOOR_PATH  = "pref_depth_model_indoor_path";
     private static final String PREF_DEPTH_MODEL_OUTDOOR_PATH = "pref_depth_model_outdoor_path";
+    //Confidence threshold for depth estimation
+    private static final float MIN_CONF_FOR_DISTANCE = 0.4f;
 
     // Kiểm tra xem đã có model usable cho mode hiện tại chưa
     // ƯU TIÊN: asset trong app  → nếu không có thì mới check file đã tải.
@@ -179,7 +181,12 @@ public class DepthEstimator implements AutoCloseable {
         if (dets == null || depthMap == null) return dets;
         List<ObjectDetector.Detection> enriched = new ArrayList<>(dets.size());
         for (ObjectDetector.Detection d : dets) {
-            enriched.add(d.withDepth(minDepth(depthMap, d)));
+            // change d.conf to whatever your field is (score/confidence)
+            if (d.score < MIN_CONF_FOR_DISTANCE) {
+                enriched.add(d.withDepth(Float.NaN));   // keep box, but "no distance"
+            } else {
+                enriched.add(d.withDepth(minDepth(depthMap, d)));
+            }
         }
         return enriched;
     }

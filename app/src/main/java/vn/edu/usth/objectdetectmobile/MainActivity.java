@@ -726,7 +726,7 @@ public class MainActivity extends ComponentActivity {
 
     private java.io.File getDepthModelFileForMode(EnvMode mode) {
         String fileName = (mode == EnvMode.OUTDOOR)
-                ? "tempDONTUSE_depth_anything_v2_metric_vkitti_vits_fp16.onnx"
+                ? "depth_anything_v2_metric_vkitti_vits_fp16.onnx"
                 : "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
 
         java.io.File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
