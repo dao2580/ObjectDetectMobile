@@ -1,0 +1,12 @@
+How to download chosen model at runtime(Hai's note)
+
+Option A: Firebase ML -> best
+	Host each .tflite as a "custom model" in Firebase
+	Download after the user picks “Indoor” or “Outdoor.”
+
+Practical implementation
+	UX: show one time choose model indoor or outdoor screen -> download, grey out the feature until it's ready
+	Background download & progress: Use WorkManager (foreground worker) for robust, cancellable downloads and user-visible progress if you self-host models.
+	Where to store files?
+	Cleanup: ability for user to delete this
+	Space constraints

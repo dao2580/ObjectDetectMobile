@@ -5,11 +5,9 @@ import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
 import android.view.View;
-import android.widget.ImageButton;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -37,14 +35,19 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy;
 
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.switchmaterial.SwitchMaterial;
+import vn.edu.usth.objectdetectmobile.utils.TTSWarning;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import ai.onnxruntime.OrtException;
+
+
+import android.os.Bundle;
 
 import android.content.Intent;
 import android.net.Uri;
@@ -54,6 +57,9 @@ import android.os.Environment;
 import android.database.Cursor;
 import android.os.Build;
 import android.content.IntentFilter;
+import android.widget.ImageButton;
+import android.os.SystemClock;
+import android.content.Context;
 
 public class MainActivity extends ComponentActivity {
     // ---------------------------------------------------------------------------------------------
@@ -166,9 +172,14 @@ public class MainActivity extends ComponentActivity {
     private boolean stereoSwitchInternalChange = false;
     private boolean envSwitchInternalChange = false;
 
+
+
+    private TTSWarning tts;
+
     // ---------------------------------------------------------------------------------------------
     //  Lifecycle & entry point
     // ---------------------------------------------------------------------------------------------
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -182,18 +193,21 @@ public class MainActivity extends ComponentActivity {
         initViews();
         initPreferencesAndCalibrationKey();
 
+        // Đăng ký broadcast receiver cho download complete
         IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            // Android 13+ requires flags: exported vs not exported
-            ContextCompat.registerReceiver(
-                    this,
-                    downloadReceiver,
-                    filter,
-                    ContextCompat.RECEIVER_NOT_EXPORTED
-            );
-        } else {
-            // Old behavior
-            registerReceiver(downloadReceiver, filter);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // Android 13+ (API 33+) yêu cầu flag RECEIVER_NOT_EXPORTED
+                registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Android 8+ (API 26+) cũng hỗ trợ flag
+                registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                // Android 7 trở xuống
+                registerReceiver(downloadReceiver, filter);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register receiver", e);
         }
 
         initControls();
@@ -206,6 +220,7 @@ public class MainActivity extends ComponentActivity {
         } else {
             startPipelines();
         }
+        tts = TTSWarning.getInstance(this);
     }
 
     // react to user choice permission
@@ -244,6 +259,9 @@ public class MainActivity extends ComponentActivity {
         depthState.lastDepthMap = null;
         depthState.lastDepthMillis = 0L;
         depthState.lastDepthCacheTime = 0L;
+        if (tts != null) {
+            tts.shutdown();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -719,7 +737,7 @@ public class MainActivity extends ComponentActivity {
 
     private java.io.File getDepthModelFileForMode(EnvMode mode) {
         String fileName = (mode == EnvMode.OUTDOOR)
-                ? "tempDONTUSE_depth_anything_v2_metric_vkitti_vits_fp16.onnx"
+                ? "depth_anything_v2_metric_vkitti_vits_fp16.onnx"
                 : "depth_anything_v2_metric_hypersim_vits_fp16.onnx";
 
         java.io.File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
@@ -841,7 +859,7 @@ public class MainActivity extends ComponentActivity {
 
     private void analyzeFrame(ImageProxy image) {
         boolean singleShotFrame = false;
-        try {   
+        try {
             boolean shouldProcess = realtimeEnabled;
             if (!shouldProcess && singleShotRequested && !singleShotRunning) {
                 singleShotRequested = false;
@@ -928,7 +946,12 @@ public class MainActivity extends ComponentActivity {
             int finalW = frameW;
             int finalH = frameH;
             List<ObjectDetector.Detection> finalDets = dets;
-            runOnUiThread(() -> overlay.setDetections(finalDets, finalW, finalH));
+            runOnUiThread(() -> {
+                overlay.setDetections(finalDets, finalW, finalH);
+
+                // ★ THÊM GỌI TTS Ở ĐÂY ★
+                processTTSWarning(finalDets);
+            });
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1134,4 +1157,50 @@ public class MainActivity extends ComponentActivity {
         bindCameraUseCases();
         updateDepthModeLabel();
     }
+    private void processTTSWarning(List<ObjectDetector.Detection> results) {
+        Log.d("TTS_DEBUG", "====================================");
+        Log.d("TTS_DEBUG", "processTTSWarning called!");
+        Log.d("TTS_DEBUG", "Results: " + (results != null ? results.size() : 0));
+        Log.d("TTS_DEBUG", "TTS: " + (tts != null ? "initialized" : "NULL"));
+
+        if (results == null || results.isEmpty() || tts == null) {
+            Log.d("TTS_DEBUG", "Skipped - results or tts is null/empty");
+            return;
+        }
+
+        List<TTSWarning.Detection> ttsDetections = new java.util.ArrayList<>();
+        List<String> labels = Arrays.asList(LabelHelper.loadLabels(this, "labels.txt"));
+
+        for (ObjectDetector.Detection det : results) {
+            if (Float.isNaN(det.depth) || det.depth <= 0) {
+                Log.w("TTS_DEBUG", "⚠️ Invalid depth for detection: " + det.depth);
+                continue;
+            }
+
+
+            float depthInCm = det.depth;
+            float depthInMeters = depthInCm / 100.0f; // Chia 100 để ra mét
+
+            Log.d("TTS_DEBUG", "Depth: " + depthInCm + "cm = " + depthInMeters + "m");
+
+            // Lấy tên label
+            String label = (det.cls >= 0 && det.cls < labels.size())
+                    ? labels.get(det.cls)
+                    : "object";
+
+            // Tạo detection với depth đã chuyển sang mét
+            TTSWarning.Detection d = new TTSWarning.Detection(label, depthInMeters);
+            ttsDetections.add(d);
+        }
+
+        if (!ttsDetections.isEmpty()) {
+            Log.d("TTS_DEBUG", "Calling TTS with " + ttsDetections.size() + " detections");
+            tts.processDetections(ttsDetections);
+        } else {
+            Log.d("TTS_DEBUG", "No valid detections to speak");
+        }
+
+        Log.d("TTS_DEBUG", "====================================");
+    }
 }
+
