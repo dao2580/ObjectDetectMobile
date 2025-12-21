@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Khi bật -->
+    <item android:color="#09B600" android:state_checked="true"/>
+    <!-- Khi tắt -->
+    <item android:color="#D79400"/> <!-- xám -->
+</selector>
