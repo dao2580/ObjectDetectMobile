@@ -178,8 +178,8 @@ public class MainActivity extends ComponentActivity {
     private boolean stereoSwitchInternalChange = false;
     private boolean envSwitchInternalChange = false;
 
-
-
+    // class-level field (member variable), here it is for warning user system
+    private java.util.List<String> cachedLabels = java.util.Collections.emptyList();
     private TTSWarning tts;
 
     // ---------------------------------------------------------------------------------------------
@@ -190,12 +190,15 @@ public class MainActivity extends ComponentActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        depthModelPrefs = getSharedPreferences(DEPTH_MODEL_PREFS, MODE_PRIVATE);
 
+        tts = TTSWarning.getInstance(this);
+
+        depthModelPrefs = getSharedPreferences(DEPTH_MODEL_PREFS, MODE_PRIVATE);
         // Single-thread CameraX analyzer
         exec = Executors.newSingleThreadExecutor();
         // Two-thread inference pool: YOLO + depth
         inferenceExec = Executors.newFixedThreadPool(2);
+
         initViews();
         initPreferencesAndCalibrationKey();
 
@@ -226,7 +229,6 @@ public class MainActivity extends ComponentActivity {
         } else {
             startPipelines();
         }
-        tts = TTSWarning.getInstance(this);
     }
 
     // react to user choice permission
@@ -288,9 +290,10 @@ public class MainActivity extends ComponentActivity {
         calibrationValue = findViewById(R.id.textCalibrationValue);
         environmentSwitch = findViewById(R.id.switchEnvironment);
 
-
         //labels of object detection
-        overlay.setLabels(LabelHelper.loadLabels(this, "labels.txt"));
+        String[] labelArr = LabelHelper.loadLabels(this, "labels.txt");
+        cachedLabels = java.util.Arrays.asList(labelArr);
+        overlay.setLabels(labelArr);
     }
 
     private void initPreferencesAndCalibrationKey() {
@@ -985,11 +988,13 @@ public class MainActivity extends ComponentActivity {
 
                 // This logs capture->TTS(begin) at the moment we START calling TTS
                 processTTSWarning(finalDets,
+                        finalW,
                         imgTsUptimeNsFinal,
                         captureToAnalyzerNsFinal,
                         processingNsFinal,
                         captureToUiCallbackNs
                 );
+
 
                 // Optional: capture -> next UI frame start (vsync)
                 overlay.postInvalidateOnAnimation();
@@ -1218,37 +1223,50 @@ public class MainActivity extends ComponentActivity {
         bindCameraUseCases();
         updateDepthModeLabel();
     }
+
+    //process TTS warning
     private void processTTSWarning(
-            List<ObjectDetector.Detection> results,
+            java.util.List<ObjectDetector.Detection> results,
+            int frameW,
             long imgTsUptimeNs,
             long captureToAnalyzerNs,
             long processingNs,
             long captureToUiCallbackNs
     ) {
         if (results == null || results.isEmpty() || tts == null) return;
+        if (cachedLabels == null || cachedLabels.isEmpty()) return;
 
-        List<TTSWarning.Detection> ttsDetections = new java.util.ArrayList<>();
-        List<String> labels = Arrays.asList(LabelHelper.loadLabels(this, "labels.txt"));
+        java.util.List<vn.edu.usth.objectdetectmobile.utils.TTSWarning.Detection> ttsDetections =
+                new java.util.ArrayList<>();
+
+        final float invW = 1.0f / Math.max(1, frameW);
 
         for (ObjectDetector.Detection det : results) {
             if (Float.isNaN(det.depth) || det.depth <= 0) continue;
 
-            float depthInMeters = det.depth / 100.0f;
+            // Your pipeline: det.depth printed as "cm" in OverlayView -> convert to meters
+            float distanceMeters = det.depth / 100.0f;
 
-            String label = (det.cls >= 0 && det.cls < labels.size())
-                    ? labels.get(det.cls)
+            String label = (det.cls >= 0 && det.cls < cachedLabels.size())
+                    ? cachedLabels.get(det.cls)
                     : "object";
 
-            ttsDetections.add(new TTSWarning.Detection(label, depthInMeters));
+            float xCenter = (det.x1 + det.x2) * 0.5f;
+
+            float xCenterNorm = clamp01(xCenter * invW);
+
+            ttsDetections.add(new vn.edu.usth.objectdetectmobile.utils.TTSWarning.Detection(
+                    label, distanceMeters, xCenterNorm
+            ));
         }
 
         if (ttsDetections.isEmpty()) return;
 
-        // ---- THIS is "capture -> UI(begin TTS)" metric ----
+        // latency log (unchanged)
         long ttsBeginNs = System.nanoTime();
         long captureToTtsBeginNs = ttsBeginNs - imgTsUptimeNs;
-
-        Log.i("LAT", String.format(
+        android.util.Log.i("LAT", String.format(
+                java.util.Locale.US,
                 "Latency(ms): cap->analyzer=%.2f, processing=%.2f, cap->UIcb=%.2f, cap->TTSbegin=%.2f (ttsDets=%d)",
                 captureToAnalyzerNs / 1e6,
                 processingNs / 1e6,
@@ -1256,10 +1274,12 @@ public class MainActivity extends ComponentActivity {
                 captureToTtsBeginNs / 1e6,
                 ttsDetections.size()
         ));
-        // --------------------------------------------------------
 
         tts.processDetections(ttsDetections);
     }
 
+    private static float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
+    }
 }
 
