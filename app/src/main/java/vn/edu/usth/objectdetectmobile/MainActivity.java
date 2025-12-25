@@ -4,6 +4,7 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.hardware.camera2.CameraCharacteristics;
 import android.os.Bundle;
 import android.util.Log;
 import android.util.Size;
@@ -62,6 +63,11 @@ import android.os.SystemClock;
 import android.content.Context;
 
 public class MainActivity extends ComponentActivity {
+    // ---- Latency logging ----
+    private static final int LAT_LOG_EVERY_N_FRAMES = 15;
+    private int latFrameCounter = 0;
+    private boolean cameraTsIsRealtime = false;
+    private long realtimeMinusUptimeOffsetNs = 0;
     // ---------------------------------------------------------------------------------------------
     //  Environment mode (indoor / outdoor)
     // ---------------------------------------------------------------------------------------------
@@ -172,8 +178,8 @@ public class MainActivity extends ComponentActivity {
     private boolean stereoSwitchInternalChange = false;
     private boolean envSwitchInternalChange = false;
 
-
-
+    // class-level field (member variable), here it is for warning user system
+    private java.util.List<String> cachedLabels = java.util.Collections.emptyList();
     private TTSWarning tts;
 
     // ---------------------------------------------------------------------------------------------
@@ -184,12 +190,15 @@ public class MainActivity extends ComponentActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        depthModelPrefs = getSharedPreferences(DEPTH_MODEL_PREFS, MODE_PRIVATE);
 
+        tts = TTSWarning.getInstance(this);
+
+        depthModelPrefs = getSharedPreferences(DEPTH_MODEL_PREFS, MODE_PRIVATE);
         // Single-thread CameraX analyzer
         exec = Executors.newSingleThreadExecutor();
         // Two-thread inference pool: YOLO + depth
         inferenceExec = Executors.newFixedThreadPool(2);
+
         initViews();
         initPreferencesAndCalibrationKey();
 
@@ -220,7 +229,6 @@ public class MainActivity extends ComponentActivity {
         } else {
             startPipelines();
         }
-        tts = TTSWarning.getInstance(this);
     }
 
     // react to user choice permission
@@ -282,9 +290,10 @@ public class MainActivity extends ComponentActivity {
         calibrationValue = findViewById(R.id.textCalibrationValue);
         environmentSwitch = findViewById(R.id.switchEnvironment);
 
-
         //labels of object detection
-        overlay.setLabels(LabelHelper.loadLabels(this, "labels.txt"));
+        String[] labelArr = LabelHelper.loadLabels(this, "labels.txt");
+        cachedLabels = java.util.Arrays.asList(labelArr);
+        overlay.setLabels(labelArr);
     }
 
     private void initPreferencesAndCalibrationKey() {
@@ -859,20 +868,35 @@ public class MainActivity extends ComponentActivity {
 
     private void analyzeFrame(ImageProxy image) {
         boolean singleShotFrame = false;
+
         try {
             boolean shouldProcess = realtimeEnabled;
+
             if (!shouldProcess && singleShotRequested && !singleShotRunning) {
                 singleShotRequested = false;
                 singleShotRunning = true;
                 singleShotFrame = true;
                 shouldProcess = true;
+
                 if (stereoFusionEnabled && !stereoPipelineAvailable) {
                     singleShotFrame = false;
                     handleSequentialDualShot();
                     return;
                 }
             }
+
             if (!shouldProcess) return;
+
+            // ---- Capture timestamp (convert to nanoTime base) ----
+            long imgTsNs = image.getImageInfo().getTimestamp();   // camera timestamp
+            long imgTsUptimeNs = cameraTsIsRealtime
+                    ? (imgTsNs - realtimeMinusUptimeOffsetNs)
+                    : imgTsNs;
+
+            // Start of YOUR processing for this frame
+            long analyzerStartNs = System.nanoTime();
+            long captureToAnalyzerNs = analyzerStartNs - imgTsUptimeNs;
+            // -----------------------------------------------------
 
             // Basic frame info
             int frameW = image.getWidth();
@@ -903,6 +927,7 @@ public class MainActivity extends ComponentActivity {
             // Run YOLO + depth in parallel on inferenceExec
             int finalFrameW1 = frameW;
             int finalFrameH1 = frameH;
+
             Future<List<ObjectDetector.Detection>> detFuture =
                     inferenceExec.submit(() -> {
                         try {
@@ -943,14 +968,45 @@ public class MainActivity extends ComponentActivity {
                 dets = stereoProcessor.fuseDepth(depthMap, dets, frameW, frameH);
             }
 
+            // End of your compute work
+            long inferenceDoneNs = System.nanoTime();
+            long processingNs = inferenceDoneNs - analyzerStartNs;
+
             int finalW = frameW;
             int finalH = frameH;
             List<ObjectDetector.Detection> finalDets = dets;
+
+            long imgTsUptimeNsFinal = imgTsUptimeNs;
+            long captureToAnalyzerNsFinal = captureToAnalyzerNs;
+            long processingNsFinal = processingNs;
+
             runOnUiThread(() -> {
+                long uiCallbackStartNs = System.nanoTime();
+                long captureToUiCallbackNs = uiCallbackStartNs - imgTsUptimeNsFinal;
+
                 overlay.setDetections(finalDets, finalW, finalH);
 
-                // ★ THÊM GỌI TTS Ở ĐÂY ★
-                processTTSWarning(finalDets);
+                // This logs capture->TTS(begin) at the moment we START calling TTS
+                processTTSWarning(finalDets,
+                        finalW,
+                        imgTsUptimeNsFinal,
+                        captureToAnalyzerNsFinal,
+                        processingNsFinal,
+                        captureToUiCallbackNs
+                );
+
+
+                // Optional: capture -> next UI frame start (vsync)
+                overlay.postInvalidateOnAnimation();
+                if ((++latFrameCounter % LAT_LOG_EVERY_N_FRAMES) == 0) {
+                    android.view.Choreographer.getInstance().postFrameCallback(frameTimeNanos -> {
+                        long capToUiFrameNs = frameTimeNanos - imgTsUptimeNsFinal;
+                        Log.i(TAG, String.format(
+                                "Latency(ms): cap->UIframe=%.2f",
+                                capToUiFrameNs / 1e6
+                        ));
+                    });
+                }
             });
 
         } catch (InterruptedException e) {
@@ -973,12 +1029,21 @@ public class MainActivity extends ComponentActivity {
     @OptIn(markerClass = ExperimentalCamera2Interop.class)
     private void setupStereoProcessorForCurrentCamera(Camera camera) {
         try {
+            CameraCharacteristics cc =
+                    Camera2CameraInfo.extractCameraCharacteristics(camera.getCameraInfo());
+
+            // ---- REQUIRED for correct capture timestamp conversion ----
+            Integer src = cc.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+            cameraTsIsRealtime = (src != null
+                    && src == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME);
+
+            // Convert REALTIME (elapsedRealtimeNanos) -> nanoTime base
+            realtimeMinusUptimeOffsetNs =
+                    SystemClock.elapsedRealtimeNanos() - System.nanoTime();
+            // ----------------------------------------------------------
+
             if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-                stereoProcessor = new StereoDepthProcessor(
-                        this,
-                        Camera2CameraInfo.extractCameraCharacteristics(
-                                camera.getCameraInfo())
-                );
+                stereoProcessor = new StereoDepthProcessor(this, cc);
                 updateStereoSwitchAvailability(true);
             } else {
                 stereoProcessor = null;
@@ -990,6 +1055,7 @@ public class MainActivity extends ComponentActivity {
             updateStereoSwitchAvailability(false);
         }
     }
+
 
     // ---------------------------------------------------------------------------------------------
     //  Stereo single-shot pipeline
@@ -1157,50 +1223,63 @@ public class MainActivity extends ComponentActivity {
         bindCameraUseCases();
         updateDepthModeLabel();
     }
-    private void processTTSWarning(List<ObjectDetector.Detection> results) {
-        Log.d("TTS_DEBUG", "====================================");
-        Log.d("TTS_DEBUG", "processTTSWarning called!");
-        Log.d("TTS_DEBUG", "Results: " + (results != null ? results.size() : 0));
-        Log.d("TTS_DEBUG", "TTS: " + (tts != null ? "initialized" : "NULL"));
 
-        if (results == null || results.isEmpty() || tts == null) {
-            Log.d("TTS_DEBUG", "Skipped - results or tts is null/empty");
-            return;
-        }
+    //process TTS warning
+    private void processTTSWarning(
+            java.util.List<ObjectDetector.Detection> results,
+            int frameW,
+            long imgTsUptimeNs,
+            long captureToAnalyzerNs,
+            long processingNs,
+            long captureToUiCallbackNs
+    ) {
+        if (results == null || results.isEmpty() || tts == null) return;
+        if (cachedLabels == null || cachedLabels.isEmpty()) return;
 
-        List<TTSWarning.Detection> ttsDetections = new java.util.ArrayList<>();
-        List<String> labels = Arrays.asList(LabelHelper.loadLabels(this, "labels.txt"));
+        java.util.List<vn.edu.usth.objectdetectmobile.utils.TTSWarning.Detection> ttsDetections =
+                new java.util.ArrayList<>();
+
+        final float invW = 1.0f / Math.max(1, frameW);
 
         for (ObjectDetector.Detection det : results) {
-            if (Float.isNaN(det.depth) || det.depth <= 0) {
-                Log.w("TTS_DEBUG", "⚠️ Invalid depth for detection: " + det.depth);
-                continue;
-            }
+            if (Float.isNaN(det.depth) || det.depth <= 0) continue;
 
+            // Your pipeline: det.depth printed as "cm" in OverlayView -> convert to meters
+            float distanceMeters = det.depth / 100.0f;
 
-            float depthInCm = det.depth;
-            float depthInMeters = depthInCm / 100.0f; // Chia 100 để ra mét
-
-            Log.d("TTS_DEBUG", "Depth: " + depthInCm + "cm = " + depthInMeters + "m");
-
-            // Lấy tên label
-            String label = (det.cls >= 0 && det.cls < labels.size())
-                    ? labels.get(det.cls)
+            String label = (det.cls >= 0 && det.cls < cachedLabels.size())
+                    ? cachedLabels.get(det.cls)
                     : "object";
 
-            // Tạo detection với depth đã chuyển sang mét
-            TTSWarning.Detection d = new TTSWarning.Detection(label, depthInMeters);
-            ttsDetections.add(d);
+            float xCenter = (det.x1 + det.x2) * 0.5f;
+
+            float xCenterNorm = clamp01(xCenter * invW);
+
+            ttsDetections.add(new vn.edu.usth.objectdetectmobile.utils.TTSWarning.Detection(
+                    label, distanceMeters, xCenterNorm
+            ));
         }
 
-        if (!ttsDetections.isEmpty()) {
-            Log.d("TTS_DEBUG", "Calling TTS with " + ttsDetections.size() + " detections");
-            tts.processDetections(ttsDetections);
-        } else {
-            Log.d("TTS_DEBUG", "No valid detections to speak");
-        }
+        if (ttsDetections.isEmpty()) return;
 
-        Log.d("TTS_DEBUG", "====================================");
+        // latency log (unchanged)
+        long ttsBeginNs = System.nanoTime();
+        long captureToTtsBeginNs = ttsBeginNs - imgTsUptimeNs;
+        android.util.Log.i("LAT", String.format(
+                java.util.Locale.US,
+                "Latency(ms): cap->analyzer=%.2f, processing=%.2f, cap->UIcb=%.2f, cap->TTSbegin=%.2f (ttsDets=%d)",
+                captureToAnalyzerNs / 1e6,
+                processingNs / 1e6,
+                captureToUiCallbackNs / 1e6,
+                captureToTtsBeginNs / 1e6,
+                ttsDetections.size()
+        ));
+
+        tts.processDetections(ttsDetections);
+    }
+
+    private static float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
     }
 }
 

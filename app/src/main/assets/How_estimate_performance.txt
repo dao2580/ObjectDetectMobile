@@ -1,0 +1,151 @@
+Optimize
+    Consider cooldown for button env mode (about 2-3s)
+
+WHICH DEVICE
+    My own phone, with API > 29
+
+Bug
+    When change env mode (indoor/outdoor), UI jank for 0.5 - 1s
+
+Scenario for testing app(most stable, easy): Open app -> scan some object for 15s -> close app
+
+Use ABD for more analyze performance
+    cd D:\platform-tools-latest-windows\platform-tools
+    .\adb devices -l
+        Check my own device is enable
+    Launch app (connect my computer with my phone) with low overhead -> profileable
+    .\adb shell perfetto -o /data/misc/perfetto-traces/trace.perfetto-trace -t 15s sched freq idle am wm gfx view
+        Record for 15s
+    .\adb shell ls -l /data/misc/perfetto-traces/
+        Check if the file exist
+    .\adb pull /data/misc/perfetto-traces/trace.perfetto-trace .
+    Go to google, access: https://ui.perfetto.dev, then open trace file
+        Our current trace file: "D:\platform-tools-latest-windows\platform-tools\trace.perfetto-trace"
+    Result form using ABD
+        use 8 CPU, which are busy and boosted
+        Ranked list thread: using sql
+            select
+              p.name as process,
+              t.name as thread,
+              sum(s.dur)/1e9 as cpu_seconds
+            from sched s
+            join thread t using(utid)
+            join process p using(upid)
+            where p.name = 'vn.edu.usth.objectdetectmobile'
+            group by 1,2
+            order by cpu_seconds desc
+            limit 20;
+        => figure in Hai personal to do
+
+
+Battery analyze
+    Important: don’t measure while USB is charging
+    Work flow
+        cd D:\platform-tools-latest-windows\platform-tools
+        .\adb devices -l
+        .\adb push .\power_config.pbtxt /data/local/tmp/power_config.pbtxt
+        .\adb shell ls -l /data/local/tmp/power_config.pbtxt
+        .\adb shell "cat /data/local/tmp/power_config.pbtxt | perfetto --txt -c - -o /data/misc/perfetto-traces/power_trace.perfetto-trace"
+        .\adb shell ls -l /data/misc/perfetto-traces/ | findstr power_trace
+        .\adb pull /data/misc/perfetto-traces/power_trace.perfetto-trace .
+        Open https://ui.perfetto.dev
+             Open trace file → select:
+             D:\platform-tools-latest-windows\platform-tools\power_trace.perfetto-trace
+    After recording
+        with batt as (
+          select cast(c.value as double) as uah
+          from counter c
+          join counter_track t on c.track_id = t.id
+          where t.name = 'batt.charge_uah'
+        )
+        select (max(uah) - min(uah)) / 1000.0 as delta_mAh
+        from batt;
+    Result
+        delta_mAh = 8 with TTL: 15s
+
+CPU usage: import recording -> cpu system trace form D:\platform-tools-latest-windows\platform-tools
+    Now: 79% - 88% total CPU (my estimate)
+
+Thermal
+    cd D:\platform-tools-latest-windows\platform-tools
+    .\adb devices -l
+    .\adb shell getprop ro.product.manufacturer
+    .\adb shell getprop ro.product.model
+    .\adb shell getprop ro.build.version.release
+    .\adb shell getprop ro.build.version.sdk
+    .\adb shell dumpsys -l | findstr /i thermal
+    .\adb shell dumpsys thermalservice > thermal_before.txt
+    for ($i=0; $i -lt 150; $i++) {
+      "==== $(Get-Date -Format o) ====" | Out-File -Append thermal_log.txt
+      .\adb shell dumpsys thermalservice | Out-File -Append thermal_log.txt
+      Start-Sleep -Seconds 2
+    }
+        (RUN every 2 second for 5 mins)
+        OR
+        for ($i=0; $i -lt 60; $i++) {
+          "==== $(Get-Date -Format o) ====" | Out-File -Append thermal_log_2m.txt
+          .\adb shell dumpsys thermalservice | Out-File -Append thermal_log_2m.txt
+          Start-Sleep -Seconds 2
+        }
+            (RUN every 2 second for 2 mins)
+    .\adb shell dumpsys thermalservice > thermal_after.txt
+
+    Result
+        Thermal status: 0 from begin to end => stable
+
+
+Latency (end-to-end camera to speech feedback)
+    Coding... DONE
+    TRACK: logcat filter -> tag:LAT -> enter
+    Result
+        Latency(ms): cap->analyzer=99.29, processing=2264.16, cap->UIcb=2363.55, cap->TTSbegin=2364.08 (ttsDets=5)
+        Avg(need to re-cal)
+            cap→analyzer: 88.38 ms
+            processing: 2162.41 ms
+            cap→UIcb: 2250.92 ms
+            cap→TTSbegin: 2251.74 ms
+            ttsDets: 3.50
+
+Profileable
+    Rebuild + reinstall
+        Rebuild: change at main menu -> build
+    Run app as "profileable" (low overhead)
+
+    Running a release/profile variant when doing battery/system-trace measurement
+        Build > Select Build Variant… → choose release for :app
+        Run as “Profileable / low overhead”
+        Record System Trace
+            Profiler → CPU → System Trace → Record
+
+    App performance
+        How to estimate
+            Android studio profiler -> overall performance (CPU, UI jank, Memory, Network, Power)
+                Open: View -> Tool Window -> Profiler (Android Studio)
+
+        Current
+            Track memory consumption
+                NOW
+                    Memory: ~935 MB - 1 GB (RAM)
+                Cách “đi từ profiler → đúng dòng code” (làm ngay với view này)
+                    Ở memory timeline phía trên, khoanh vùng đúng đoạn bạn đang test (drag chọn 2–5s quanh lúc chạy inference). Việc chọn time range giúp lọc đúng allocations.
+                    Trong Visualization, bấm vào block dài nhất trong <Thread pool-4-thread-2> (đang là khối createTensor/allocateDirect/...).
+                    Mở Table tab và sort theo Allocations / Remaining Size / Total Count để xem class nào tăng bất thường (doc giải thích ý nghĩa các cột này).
+                    Click 1 class → xem Allocation Call Stack rồi right-click → Go to source để nhảy tới đúng chỗ tạo object
+
+            Heap dump
+                Way to analyze fast + correct
+                    Sort theo Retained size(decrease order)
+                    Filter leak fo android studio(consider leak Activity/Fragment)
+                    Capture some heap dump from time to time
+                Terminology
+                    Shallow size: total main memory of objects in JAVA
+                    Retained size: memory is released -> important to detect "culprit take RAM"
+                    Native size: memory native ~ Bitmap often takes native
+                NOW
+                    Leak: 0
+                    Count: 60395, classes: 1826
+
+            Network (for only download model)
+                Works normal (How normal?)
+
+

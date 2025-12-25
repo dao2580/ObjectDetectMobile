@@ -13,11 +13,12 @@ import static java.lang.Math.*;
 
 public class ObjectDetector implements AutoCloseable {
     public static class Detection {
-        public final float x1,y1,x2,y2,score,depth; public final int cls;
+        public final float x1,y1,x2,y2,score,depth;
+        public final int cls;       // class id
         public Detection(float x1,float y1,float x2,float y2,float score,int cls){
             this(x1,y1,x2,y2,score,cls,Float.NaN);
         }
-        private Detection(float x1,float y1,float x2,float y2,float score,int cls,float depth){
+        public Detection(float x1,float y1,float x2,float y2,float score,int cls,float depth){
             this.x1=x1; this.y1=y1; this.x2=x2; this.y2=y2; this.score=score; this.cls=cls; this.depth=depth;
         }
         public Detection withDepth(float depthValue){
@@ -35,8 +36,6 @@ public class ObjectDetector implements AutoCloseable {
         env = OrtEnvironment.getEnvironment();
         String modelPath = Util.cacheAsset(ctx, "yolov8m_compatible.onnx");
         OrtSession.SessionOptions so = new OrtSession.SessionOptions();
-        // Optional: enable NNAPI on supported devices
-        // so.addNnapi();  // See ORT NNAPI EP docs
         session = env.createSession(modelPath, so);
         inputName = session.getInputInfo().keySet().iterator().next();
     }
